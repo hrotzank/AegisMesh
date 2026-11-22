@@ -27,6 +27,14 @@ class FileScanRequest(BaseModel):
     mime_type: str = "application/octet-stream"
 
 
+class ApkScanRequest(BaseModel):
+    filename: str
+    size_bytes: int
+    sha256: str
+    entries: list[str] = []
+    selected_permissions: list[str] = []
+
+
 SHORTENERS = {
     "bit.ly", "tinyurl.com", "t.co", "goo.gl", "ow.ly",
     "is.gd", "buff.ly", "rebrand.ly", "cutt.ly", "rb.gy"
@@ -46,6 +54,59 @@ HIGH_RISK_EXTENSIONS = {
 
 MEDIUM_RISK_EXTENSIONS = {
     ".zip", ".rar", ".7z", ".tar", ".gz", ".iso", ".img", ".docm", ".xlsm", ".pptm"
+}
+
+SENSITIVE_PERMISSIONS = {
+    "BIND_ACCESSIBILITY_SERVICE": {
+        "severity": "Crítico",
+        "score": 35,
+        "desc": "Permite interceptar eventos del sistema, teclado y contenido en pantalla (abuso común en troyanos bancarios).",
+    },
+    "SYSTEM_ALERT_WINDOW": {
+        "severity": "Crítico",
+        "score": 28,
+        "desc": "Capacidad de dibujar sobre otras apps para ataques de overlay y suplantación de credenciales.",
+    },
+    "REQUEST_INSTALL_PACKAGES": {
+        "severity": "Alto",
+        "score": 25,
+        "desc": "Permite descargar e instalar paquetes APK secundarios eludiendo tiendas oficiales (dropper).",
+    },
+    "READ_SMS": {
+        "severity": "Alto",
+        "score": 24,
+        "desc": "Acceso de lectura a mensajes SMS para interceptar códigos 2FA y transacciones bancarias.",
+    },
+    "SEND_SMS": {
+        "severity": "Alto",
+        "score": 24,
+        "desc": "Envío de SMS silenciosos a números de tarificación adicional o exfiltración C2.",
+    },
+    "RECEIVE_SMS": {
+        "severity": "Alto",
+        "score": 22,
+        "desc": "Interceptación pasiva de SMS entrantes en tiempo real.",
+    },
+    "RECORD_AUDIO": {
+        "severity": "Alto",
+        "score": 20,
+        "desc": "Grabación de audio ambiental desde el micrófono sin confirmación visual activa.",
+    },
+    "READ_CONTACTS": {
+        "severity": "Medio",
+        "score": 14,
+        "desc": "Lectura de la agenda de contactos con fines de propagación o perfilamiento.",
+    },
+    "ACCESS_FINE_LOCATION": {
+        "severity": "Medio",
+        "score": 14,
+        "desc": "Geolocalización satelital precisa del dispositivo.",
+    },
+    "INTERNET": {
+        "severity": "Bajo",
+        "score": 5,
+        "desc": "Conectividad de red estándar requerida para comunicaciones salientes.",
+    },
 }
 
 
@@ -276,6 +337,154 @@ def scan_file(payload: FileScanRequest):
         "sizeBytes": size_bytes,
         "sha256": sha256,
         "mimeType": payload.mime_type or "application/octet-stream",
+        "riskScore": score,
+        "riskLevel": risk_level,
+        "scannedAt": datetime.now(timezone.utc).strftime("%H:%M:%S UTC"),
+        "findings": findings,
+    }
+
+
+@app.post("/api/scan/apk")
+def scan_apk(payload: ApkScanRequest):
+    clean_name = payload.filename.strip() or "paquete.apk"
+    lower_name = clean_name.lower()
+    size_bytes = max(0, payload.size_bytes)
+    sha256 = payload.sha256.strip().lower() or "no-disponible"
+    entries = payload.entries or []
+    selected_perms = [p.strip().upper() for p in payload.selected_permissions if p.strip()]
+
+    score = 10
+    findings: list[dict[str, str]] = []
+
+    # 1. Extensión del archivo
+    if not lower_name.endswith(".apk"):
+        score += 25
+        findings.append({
+            "severity": "Alto",
+            "title": "Extensión no estándar para paquete Android",
+            "detail": f"El archivo '{clean_name}' no finaliza con la extensión '.apk'.",
+        })
+
+    # 2. Análisis estructural de entradas internas
+    lower_entries = [e.lower() for e in entries]
+    total_entries = len(entries)
+    has_manifest = any(e.endswith("androidmanifest.xml") for e in lower_entries)
+    dex_files = [e for e in lower_entries if e.endswith(".dex")]
+    dex_count = len(dex_files)
+    native_libs = [e for e in lower_entries if e.startswith("lib/") and e.endswith(".so")]
+    native_lib_count = len(native_libs)
+
+    if entries:
+        if not has_manifest:
+            score += 30
+            findings.append({
+                "severity": "Alto",
+                "title": "Ausencia de AndroidManifest.xml",
+                "detail": "El archivo ZIP/APK analizado no contiene el manifiesto principal de Android.",
+            })
+
+        if dex_count == 0:
+            score += 25
+            findings.append({
+                "severity": "Alto",
+                "title": "Sin bytecode Dalvik ejecutable (.dex)",
+                "detail": "No se encontraron archivos classes.dex en la raíz del paquete.",
+            })
+        elif dex_count > 4:
+            score += 15
+            findings.append({
+                "severity": "Medio",
+                "title": f"Múltiples archivos DEX detectados ({dex_count})",
+                "detail": "Estructura multi-DEX amplia, habitual en apps complejas o con módulos ofuscados.",
+            })
+
+        if native_lib_count > 0:
+            findings.append({
+                "severity": "Medio",
+                "title": f"Binarios nativos compilados ({native_lib_count} archivos .so)",
+                "detail": "La aplicación incluye código binario nativo (C/C++), potencialmente capaz de evadir inspecciones basadas solo en Dalvik.",
+            })
+            score += 10
+
+    # 3. Tamaño anómalo
+    if size_bytes == 0:
+        score += 25
+        findings.append({
+            "severity": "Medio",
+            "title": "Paquete APK vacío (0 bytes)",
+            "detail": "El archivo carece de contenido para análisis de firma o estructura.",
+        })
+    elif size_bytes > 120 * 1024 * 1024:
+        score += 10
+        findings.append({
+            "severity": "Medio",
+            "title": "Tamaño de paquete considerable (> 120 MB)",
+            "detail": "El APK posee un volumen elevado, habitual en empaquetadores con assets pesados o código embebido.",
+        })
+
+    # 4. Análisis de permisos sensibles
+    perm_score_accum = 0
+    for perm in selected_perms:
+        clean_perm = perm.replace("ANDROID.PERMISSION.", "")
+        meta = SENSITIVE_PERMISSIONS.get(clean_perm)
+        if meta:
+            perm_score_accum += meta["score"]
+            findings.append({
+                "severity": meta["severity"],
+                "title": f"Permiso de riesgo: {clean_perm}",
+                "detail": meta["desc"],
+            })
+
+    # Combinación de alto riesgo: Accesibilidad + Overlay o SMS
+    perm_names = [p.replace("ANDROID.PERMISSION.", "") for p in selected_perms]
+    if "BIND_ACCESSIBILITY_SERVICE" in perm_names:
+        has_overlay = "SYSTEM_ALERT_WINDOW" in perm_names
+        has_sms = any(s in perm_names for s in ("READ_SMS", "RECEIVE_SMS", "SEND_SMS"))
+        if has_overlay or has_sms:
+            perm_score_accum += 20
+            findings.append({
+                "severity": "Crítico",
+                "title": "Vector de ataque combinado (Accessibility + Overlay/SMS)",
+                "detail": "Patrón de comportamiento característico de troyanos bancarios y keyloggers en Android.",
+            })
+
+    score += min(perm_score_accum, 55)
+
+    # 5. Verificación de hash SHA-256
+    if len(sha256) != 64 or not all(c in "0123456789abcdef" for c in sha256):
+        score += 8
+        findings.append({
+            "severity": "Medio",
+            "title": "Hash SHA-256 no estándar",
+            "detail": "No se validó un digest SHA-256 estándar de 64 caracteres.",
+        })
+
+    score = min(score, 99)
+    if score >= 75:
+        risk_level = "Crítico"
+    elif score >= 50:
+        risk_level = "Alto"
+    elif score >= 25:
+        risk_level = "Medio"
+    else:
+        risk_level = "Bajo"
+
+    if not findings:
+        findings.append({
+            "severity": "Bajo",
+            "title": "Sin indicadores de riesgo elevados",
+            "detail": "La configuración de permisos y estructura básica del APK no presentan anomalías severas.",
+        })
+
+    return {
+        "filename": clean_name,
+        "sizeBytes": size_bytes,
+        "sha256": sha256,
+        "totalEntries": total_entries,
+        "dexCount": dex_count,
+        "nativeLibCount": native_lib_count,
+        "hasManifest": has_manifest,
+        "permissionsAnalyzed": selected_perms,
         "riskScore": score,
         "riskLevel": risk_level,
         "scannedAt": datetime.now(timezone.utc).strftime("%H:%M:%S UTC"),
