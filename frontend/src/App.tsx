@@ -6,6 +6,7 @@ import { ThreatGraph } from "./components/ThreatGraph";
 import { LinkScanner } from "./components/LinkScanner";
 import { FileScanner } from "./components/FileScanner";
 import { ApkAnalyzer } from "./components/ApkAnalyzer";
+import { NetworkAnalyzer } from "./components/NetworkAnalyzer";
 import { SectionId } from "./types/navigation";
 
 export default function App() {
@@ -28,12 +29,14 @@ export default function App() {
             {activeSection === "link-scanner" && <LinkScanner />}
             {activeSection === "file-scanner" && <FileScanner />}
             {activeSection === "apk-analyzer" && <ApkAnalyzer />}
+            {activeSection === "network-analyzer" && <NetworkAnalyzer />}
             {activeSection === "threat-correlation" && <ThreatGraph />}
 
             {activeSection !== "dashboard" &&
               activeSection !== "link-scanner" &&
               activeSection !== "file-scanner" &&
               activeSection !== "apk-analyzer" &&
+              activeSection !== "network-analyzer" &&
               activeSection !== "threat-correlation" && (
                 <div className="rounded-xl border border-slate-800/90 bg-[#0d1424]/85 p-6 backdrop-blur-md">
                   <p className="text-xs font-mono uppercase tracking-wider text-cyan-400">

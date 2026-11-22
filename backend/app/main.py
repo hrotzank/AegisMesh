@@ -1,9 +1,10 @@
+import ipaddress
 import re
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 app = FastAPI(title="AegisMesh API")
 
@@ -33,6 +34,11 @@ class ApkScanRequest(BaseModel):
     sha256: str
     entries: list[str] = []
     selected_permissions: list[str] = []
+
+
+class NetworkScanRequest(BaseModel):
+    target: str
+    ports: list[int] = Field(default_factory=lambda: [22, 80, 443, 3389, 8080])
 
 
 SHORTENERS = {
@@ -106,6 +112,117 @@ SENSITIVE_PERMISSIONS = {
         "severity": "Bajo",
         "score": 5,
         "desc": "Conectividad de red estándar requerida para comunicaciones salientes.",
+    },
+}
+
+PORT_RISK_MAP = {
+    21: {
+        "service": "FTP",
+        "severity": "Alto",
+        "score": 25,
+        "desc": "Protocolo de transferencia de archivos sin cifrado nativo (credenciales en texto plano).",
+    },
+    22: {
+        "service": "SSH",
+        "severity": "Medio",
+        "score": 12,
+        "desc": "Terminal remota segura. Expuesto a ataques de fuerza bruta si no cuenta con fail2ban/claves.",
+    },
+    23: {
+        "service": "Telnet",
+        "severity": "Crítico",
+        "score": 35,
+        "desc": "Protocolo obsoleto sin cifrado; interceptación directa de sesiones y contraseñas.",
+    },
+    25: {
+        "service": "SMTP",
+        "severity": "Medio",
+        "score": 15,
+        "desc": "Servicio de correo saliente. Riesgo de relay abierto si no está autenticado.",
+    },
+    53: {
+        "service": "DNS",
+        "severity": "Medio",
+        "score": 14,
+        "desc": "Servicio de resolución de nombres. Vector potencial de amplificación DDoS o envenenamiento de caché.",
+    },
+    80: {
+        "service": "HTTP",
+        "severity": "Medio",
+        "score": 15,
+        "desc": "Servicio web sin cifrado TLS/SSL. Tráfico vulnerable a inspección y modificación en tránsito.",
+    },
+    110: {
+        "service": "POP3",
+        "severity": "Medio",
+        "score": 16,
+        "desc": "Acceso a buzón de correo sin cifrado por defecto.",
+    },
+    143: {
+        "service": "IMAP",
+        "severity": "Medio",
+        "score": 16,
+        "desc": "Sincronización de correo electrónico sin TLS por defecto.",
+    },
+    443: {
+        "service": "HTTPS",
+        "severity": "Bajo",
+        "score": 5,
+        "desc": "Canal web cifrado estándar. Buenas prácticas de confidencialidad e integridad.",
+    },
+    445: {
+        "service": "SMB",
+        "severity": "Crítico",
+        "score": 38,
+        "desc": "Compartición de archivos Windows/Samba. Vector crítico de propagación lateral y exploits (EternalBlue).",
+    },
+    1433: {
+        "service": "MSSQL",
+        "severity": "Alto",
+        "score": 28,
+        "desc": "Base de datos Microsoft SQL Server expuesta a la red.",
+    },
+    3306: {
+        "service": "MySQL/MariaDB",
+        "severity": "Alto",
+        "score": 28,
+        "desc": "Base de datos relacional expuesta sin aislamiento de capa de aplicación.",
+    },
+    3389: {
+        "service": "RDP",
+        "severity": "Alto",
+        "score": 30,
+        "desc": "Escritorio remoto de Windows. Objetivo primario de ataques de fuerza bruta y ransomware.",
+    },
+    5432: {
+        "service": "PostgreSQL",
+        "severity": "Alto",
+        "score": 28,
+        "desc": "Base de datos PostgreSQL expuesta directamente.",
+    },
+    6379: {
+        "service": "Redis",
+        "severity": "Crítico",
+        "score": 36,
+        "desc": "Almacén en memoria habitualmente configurado sin contraseña o con permisos root.",
+    },
+    8080: {
+        "service": "HTTP-Proxy/Alt",
+        "severity": "Medio",
+        "score": 16,
+        "desc": "Servicio web alternativo, interfaces de administración o proxys sin TLS.",
+    },
+    8443: {
+        "service": "HTTPS-Alt",
+        "severity": "Bajo",
+        "score": 6,
+        "desc": "Servicio web seguro alternativo.",
+    },
+    27017: {
+        "service": "MongoDB",
+        "severity": "Crítico",
+        "score": 36,
+        "desc": "Base de datos NoSQL con riesgo histórico de exposición no autenticada.",
     },
 }
 
@@ -485,6 +602,173 @@ def scan_apk(payload: ApkScanRequest):
         "nativeLibCount": native_lib_count,
         "hasManifest": has_manifest,
         "permissionsAnalyzed": selected_perms,
+        "riskScore": score,
+        "riskLevel": risk_level,
+        "scannedAt": datetime.now(timezone.utc).strftime("%H:%M:%S UTC"),
+        "findings": findings,
+    }
+
+
+@app.post("/api/scan/network")
+def scan_network(payload: NetworkScanRequest):
+    raw_target = payload.target.strip()
+    ports = sorted(list(set(payload.ports if payload.ports else [22, 80, 443, 3389, 8080])))
+    valid_ports = [p for p in ports if 1 <= p <= 65535]
+
+    score = 10
+    findings: list[dict[str, str]] = []
+
+    # Quitar posibles prefijos de protocolo http:// o https://
+    cleaned_target = re.sub(r"^https?://", "", raw_target)
+    if "/" in cleaned_target and not re.search(r"/\d{1,2}$", cleaned_target):
+        cleaned_target = cleaned_target.split("/")[0]
+
+    # Quitar puerto si viene en el host ej 192.168.1.1:80
+    if ":" in cleaned_target and not (cleaned_target.startswith("[") or cleaned_target.count(":") > 1):
+        cleaned_target = cleaned_target.split(":")[0]
+
+    target_type = "Dominio / Hostname"
+    network_scope = "Internet Pública"
+    resolved_host = cleaned_target
+
+    # 1. Validación de IPv4 / CIDR / Loopback / LAN
+    is_cidr = "/" in cleaned_target
+    try:
+        if is_cidr:
+            net = ipaddress.ip_network(cleaned_target, strict=False)
+            target_type = f"Subred CIDR IPv4 (/{net.prefixlen})"
+            resolved_host = str(net.network_address)
+            if net.is_loopback:
+                network_scope = "Loopback / Localhost"
+            elif net.is_private:
+                network_scope = "Red Privada / LAN"
+            elif net.is_link_local:
+                network_scope = "Link-Local"
+            else:
+                network_scope = "Internet Pública"
+        else:
+            ip_obj = ipaddress.ip_address(cleaned_target)
+            target_type = "Dirección IPv4" if ip_obj.version == 4 else "Dirección IPv6"
+            resolved_host = str(ip_obj)
+            if ip_obj.is_loopback or cleaned_target in ("127.0.0.1", "localhost", "::1"):
+                network_scope = "Loopback / Localhost"
+            elif ip_obj.is_private:
+                network_scope = "Red Privada / LAN"
+            elif ip_obj.is_link_local:
+                network_scope = "Link-Local"
+            else:
+                network_scope = "Internet Pública"
+    except ValueError:
+        target_type = "Dominio / FQDN"
+        if cleaned_target.lower() in ("localhost", "localhost.localdomain"):
+            network_scope = "Loopback / Localhost"
+        elif cleaned_target.endswith((".local", ".internal", ".lan", ".home")):
+            network_scope = "Red Privada / LAN"
+        else:
+            network_scope = "Internet Pública"
+
+    # Hallazgo de ámbito de red
+    if network_scope == "Red Privada / LAN":
+        findings.append({
+            "severity": "Bajo",
+            "title": f"Objetivo en ámbito privado ({network_scope})",
+            "detail": f"El objetivo '{cleaned_target}' pertenece a un segmento no enrutable en Internet (RFC1918). Protegido tras NAT o cortafuegos perimetral.",
+        })
+    elif network_scope == "Loopback / Localhost":
+        findings.append({
+            "severity": "Bajo",
+            "title": "Interfaz local de bucle (Loopback)",
+            "detail": "El escaneo apunta a la propia máquina local. Los puertos analizados no están expuestos externamente.",
+        })
+    else:
+        score += 15
+        findings.append({
+            "severity": "Medio",
+            "title": "Exposición en Internet Pública",
+            "detail": f"El objetivo '{cleaned_target}' se encuentra en direccionamiento público global. La superficie de ataque es accesible para escaneos indiscriminados.",
+        })
+
+    # Hallazgo si es subred CIDR amplia
+    if is_cidr and target_type.startswith("Subred"):
+        prefix = int(cleaned_target.split("/")[1])
+        if prefix < 24:
+            score += 12
+            findings.append({
+                "severity": "Medio",
+                "title": f"Máscara de subred amplia (/{prefix})",
+                "detail": "El rango abarca un volumen elevado de direcciones IP consecutivas, incrementando la superficie de barrido.",
+            })
+
+    # 2. Análisis de superficie por puertos
+    ports_detail: list[dict[str, object]] = []
+    port_risk_accum = 0
+
+    for port in valid_ports:
+        meta = PORT_RISK_MAP.get(port, {
+            "service": "Servicio Desconocido / Personalizado",
+            "severity": "Medio" if port < 1024 else "Bajo",
+            "score": 10 if port < 1024 else 5,
+            "desc": f"Puerto TCP {port} registrado en la verificación de superficie.",
+        })
+
+        port_score = meta["score"]
+        # En Internet pública, servicios sensibles o sin cifrar son más críticos
+        if network_scope == "Internet Pública" and port in (21, 23, 445, 1433, 3306, 3389, 5432, 6379, 27017):
+            port_score = int(port_score * 1.25)
+            findings.append({
+                "severity": "Crítico",
+                "title": f"Servicio crítico {meta['service']} (:{port}) expuesto en Internet Pública",
+                "detail": f"El servicio {meta['service']} (puerto {port}) no debe exponerse a Internet sin VPN ni túnel autenticado.",
+            })
+        else:
+            findings.append({
+                "severity": meta["severity"],
+                "title": f"Puerto {port}/TCP ({meta['service']}) evaluado",
+                "detail": meta["desc"],
+            })
+
+        port_risk_accum += port_score
+        ports_detail.append({
+            "port": port,
+            "service": meta["service"],
+            "severity": meta["severity"],
+        })
+
+    # Detección de protocolos legacy / alta vulnerabilidad
+    if 23 in valid_ports or 445 in valid_ports:
+        port_risk_accum += 15
+        findings.append({
+            "severity": "Crítico",
+            "title": "Detección de protocolos legacy / alta vulnerabilidad (Telnet/SMB)",
+            "detail": "La presencia de puertos 23 o 445 representa un riesgo mayor de compromiso o propagación de malware.",
+        })
+
+    if len(valid_ports) >= 8:
+        score += 10
+        findings.append({
+            "severity": "Medio",
+            "title": "Superficie de puertos amplia",
+            "detail": f"Se especificaron {len(valid_ports)} puertos objetivo simultáneos.",
+        })
+
+    score += min(port_risk_accum, 55)
+    score = min(score, 99)
+
+    if score >= 75:
+        risk_level = "Crítico"
+    elif score >= 50:
+        risk_level = "Alto"
+    elif score >= 25:
+        risk_level = "Medio"
+    else:
+        risk_level = "Bajo"
+
+    return {
+        "target": raw_target,
+        "resolvedHost": resolved_host,
+        "targetType": target_type,
+        "networkScope": network_scope,
+        "openOrCheckedPorts": ports_detail,
         "riskScore": score,
         "riskLevel": risk_level,
         "scannedAt": datetime.now(timezone.utc).strftime("%H:%M:%S UTC"),
