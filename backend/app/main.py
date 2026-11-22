@@ -20,6 +20,13 @@ class LinkScanRequest(BaseModel):
     url: str
 
 
+class FileScanRequest(BaseModel):
+    filename: str
+    size_bytes: int
+    sha256: str
+    mime_type: str = "application/octet-stream"
+
+
 SHORTENERS = {
     "bit.ly", "tinyurl.com", "t.co", "goo.gl", "ow.ly",
     "is.gd", "buff.ly", "rebrand.ly", "cutt.ly", "rb.gy"
@@ -31,6 +38,15 @@ PHISHING_TOKENS = [
     "login", "signin", "verify", "update", "secure", "account",
     "banking", "wallet", "confirm", "suspend", "free", "bonus", "password"
 ]
+
+HIGH_RISK_EXTENSIONS = {
+    ".exe", ".dll", ".scr", ".bat", ".cmd", ".ps1", ".vbs", ".vbe",
+    ".js", ".jse", ".wsf", ".wsh", ".apk", ".jar", ".msi", ".reg"
+}
+
+MEDIUM_RISK_EXTENSIONS = {
+    ".zip", ".rar", ".7z", ".tar", ".gz", ".iso", ".img", ".docm", ".xlsm", ".pptm"
+}
 
 
 @app.get("/health")
@@ -169,6 +185,97 @@ def scan_link(payload: LinkScanRequest):
         "url": raw_url,
         "domain": host,
         "protocol": parsed.scheme.upper(),
+        "riskScore": score,
+        "riskLevel": risk_level,
+        "scannedAt": datetime.now(timezone.utc).strftime("%H:%M:%S UTC"),
+        "findings": findings,
+    }
+
+
+@app.post("/api/scan/file")
+def scan_file(payload: FileScanRequest):
+    clean_name = payload.filename.strip() or "archivo_sin_nombre"
+    lower_name = clean_name.lower()
+    size_bytes = max(0, payload.size_bytes)
+    sha256 = payload.sha256.strip().lower() or "no-disponible"
+
+    score = 10
+    findings: list[dict[str, str]] = []
+
+    parts = [p for p in lower_name.split(".") if p]
+    if len(parts) >= 3:
+        last_ext = f".{parts[-1]}"
+        prev_ext = f".{parts[-2]}"
+        if last_ext in HIGH_RISK_EXTENSIONS and prev_ext in {".pdf", ".doc", ".docx", ".xls", ".xlsx", ".jpg", ".png", ".txt"}:
+            score += 38
+            findings.append({
+                "severity": "Crítico",
+                "title": "Técnica de doble extensión detectada",
+                "detail": f"El archivo '{clean_name}' disfraza un ejecutable ({last_ext}) tras una extensión común ({prev_ext}).",
+            })
+
+    ext = f".{parts[-1]}" if len(parts) >= 2 else ""
+    if ext in HIGH_RISK_EXTENSIONS:
+        score += 32
+        findings.append({
+            "severity": "Alto",
+            "title": f"Tipo de archivo ejecutable o script ({ext})",
+            "detail": "Los binarios, scripts o instaladores requieren inspección adicional antes de ejecutarse.",
+        })
+    elif ext in MEDIUM_RISK_EXTENSIONS:
+        score += 18
+        findings.append({
+            "severity": "Medio",
+            "title": f"Contenedor comprimido o imagen ({ext})",
+            "detail": "Puede ocultar cargas útiles o archivos maliciosos en su interior.",
+        })
+
+    if size_bytes == 0:
+        score += 15
+        findings.append({
+            "severity": "Medio",
+            "title": "Archivo vacío (0 bytes)",
+            "detail": "Un archivo sin contenido puede ser un marcador o un artefacto incompleto.",
+        })
+    elif size_bytes > 100 * 1024 * 1024:
+        score += 12
+        findings.append({
+            "severity": "Medio",
+            "title": "Tamaño de archivo elevado (> 100 MB)",
+            "detail": "Los archivos muy pesados suelen requerir análisis por lotes o en sandbox.",
+        })
+
+    if len(sha256) != 64 or not all(c in "0123456789abcdef" for c in sha256):
+        score += 10
+        findings.append({
+            "severity": "Medio",
+            "title": "Hash SHA-256 no estándar o incompleto",
+            "detail": "No se pudo validar un digest hexadecimal de 64 caracteres.",
+        })
+
+    score = min(score, 99)
+    if score >= 75:
+        risk_level = "Crítico"
+    elif score >= 50:
+        risk_level = "Alto"
+    elif score >= 25:
+        risk_level = "Medio"
+    else:
+        risk_level = "Bajo"
+
+    if not findings:
+        findings.append({
+            "severity": "Bajo",
+            "title": "Sin indicadores sospechosos en metadatos",
+            "detail": "La extensión y estructura del archivo no muestran patrones heurísticos de riesgo.",
+        })
+
+    return {
+        "filename": clean_name,
+        "extension": ext or "sin extensión",
+        "sizeBytes": size_bytes,
+        "sha256": sha256,
+        "mimeType": payload.mime_type or "application/octet-stream",
         "riskScore": score,
         "riskLevel": risk_level,
         "scannedAt": datetime.now(timezone.utc).strftime("%H:%M:%S UTC"),
